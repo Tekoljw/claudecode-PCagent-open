@@ -4,9 +4,10 @@ PC 远程控制 Agent - 跨平台（Windows/macOS/Linux）
 运行方式：python agent.py 或双击可执行文件
 
 认证模型：验证码配对 + 设备专属令牌
-- 首次使用：填入关联的 Bot Token，点击"获取验证码"，
-  服务器把验证码推给 Telegram 里的管理员，1 小时内有效。
-  把验证码填回这里完成配对，之后自动颁发本机专属的 device_token。
+- 首次使用：点击"获取验证码"，服务器把验证码推给 Telegram 里的管理员，
+  1 小时内有效。把验证码填回这里完成配对，之后自动颁发本机专属的
+  device_token。配对成功后由哪个 Bot 管理这台设备，是服务端的管理员
+  决定的事（在 /pc_list 里绑定），客户端无需也无法指定。
 - 之后每次启动：用本地保存的 device_token 自动认证，无需人工操作。
 """
 
@@ -44,7 +45,6 @@ DEFAULT_CONFIG = {
     # Agent 走 wss://<server_host>/agent 连接服务器。
     "server_host": "claudbotjs.doez.ai",
     "server_port": 443,
-    "bot_token": "",
     "device_token": None,  # 配对成功后颁发，本机专属，不要跟其他设备共用
     "enabled": True,
 }
@@ -131,6 +131,7 @@ class AgentClient:
         self.callbacks = callbacks or {}
         self.reconnect_count = 0
         self.max_reconnect = 5
+        self._connecting = False  # 防止开关被连续点击时启动重复的连接线程
 
     def _cb(self, name, *args):
         fn = self.callbacks.get(name)
@@ -169,11 +170,13 @@ class AgentClient:
         except Exception as e:
             log(f"连接失败: {e}")
             self.connected = False
+            self._connecting = False
             self._cb("on_status_change", "连接失败", False)
             self.reconnect()
 
     def on_open(self, ws):
         self.connected = True
+        self._connecting = False
         self.reconnect_count = 0
         log("WebSocket 连接打开")
 
@@ -191,7 +194,7 @@ class AgentClient:
             log("尚未配对，等待用户在 GUI 里获取验证码")
             self._cb("on_status_change", "未配对", False)
 
-    def request_pairing_code(self, bot_token):
+    def request_pairing_code(self):
         """GUI 点击"获取验证码"时调用"""
         if not self.ws or not self.connected:
             return False
@@ -200,9 +203,8 @@ class AgentClient:
             "mac_address": self.mac_address,
             "hostname": self.hostname,
             "os": self.os,
-            "bot_token": bot_token or "",
         }))
-        log(f"已请求配对验证码 (bot_token={'已填写' if bot_token else '未填写'})")
+        log("已请求配对验证码")
         return True
 
     def submit_pairing_code(self, code):
@@ -303,6 +305,21 @@ class AgentClient:
         else:
             log("重连失败次数过多，停止重试")
 
+    def set_enabled(self, enabled):
+        """开关立即生效：关闭时断开连接，开启时拉起新的连接线程。
+        不能只写配置——之前的实现只在点"保存设置"时更新 config，开关本身不触发
+        任何实际的连接/断开动作，用户勾掉复选框后连接依然挂着。"""
+        self.config["enabled"] = enabled
+        save_config(self.config)
+        if enabled:
+            if not self.connected and not self._connecting:
+                self._connecting = True
+                self.reconnect_count = 0
+                threading.Thread(target=self.connect, daemon=True).start()
+        else:
+            if self.ws:
+                self.ws.close()
+
     def stop(self):
         self.config["enabled"] = False
         if self.ws:
@@ -327,11 +344,8 @@ def create_gui(config):
 
     pairing_layout = [
         [sg.Text("首次使用需要配对", font=FONT_BOLD, pad=((0, 0), (0, 10)))],
-        [sg.Text("关联 Bot Token", font=FONT_SUB, text_color="grey")],
-        [sg.InputText(
-            config.get("bot_token", ""), key="-BOT_TOKEN-", size=(36, 1),
-            tooltip="填入 Telegram Bot Token；验证码会通过它推给管理员",
-            pad=((0, 0), (2, 12)))],
+        [sg.Text("点击下方按钮获取验证码，管理员会在 Telegram 收到推送",
+                  font=FONT_SUB, text_color="grey", pad=((0, 0), (0, 12)))],
         [sg.Button("获取验证码", key="-GET_CODE-", size=(14, 1))],
         [sg.Text("验证码", font=FONT_SUB, text_color="grey", key="-PAIR_CODE_LABEL-",
                   visible=False, pad=((0, 0), (14, 2)))],
@@ -353,7 +367,7 @@ def create_gui(config):
         [sg.Text("最后心跳", font=FONT_SUB, text_color="grey", size=(10, 1)),
          sg.Push(), sg.Text("", key="-LAST_BEAT-", font=FONT_LABEL)],
         [sg.HSeparator(pad=((0, 0), (14, 12)))],
-        [sg.Checkbox("启用远程访问", default=config.get("enabled", True), key="-ENABLED-")],
+        [sg.Checkbox("启用远程访问", default=config.get("enabled", True), key="-ENABLED-", enable_events=True)],
         [sg.Button("解除配对", key="-UNPAIR-",
                     tooltip="清除本机令牌，需要重新走验证码配对", pad=((0, 0), (12, 0)))],
     ]
@@ -404,10 +418,7 @@ def main():
             break
 
         if event == "-GET_CODE-":
-            bot_token = values["-BOT_TOKEN-"].strip()
-            config["bot_token"] = bot_token
-            save_config(config)
-            if client.request_pairing_code(bot_token):
+            if client.request_pairing_code():
                 window["-PAIR_STATUS-"].update("正在请求验证码…", text_color="orange")
             else:
                 window["-PAIR_STATUS-"].update("尚未连接到服务器，请稍候重试", text_color="red")
@@ -447,11 +458,16 @@ def main():
         elif event == "-EVT_PCINFO-":
             window["-PC_NAME-"].update(values[event])
 
+        elif event == "-ENABLED-":
+            enabled = values["-ENABLED-"]
+            client.set_enabled(enabled)
+            window["-STATUS-"].update("已禁用" if not enabled else "正在连接…")
+            window["-STATUS_DOT-"].update(text_color="#E53935")
+            log(f"远程访问开关: enabled={enabled}")
+
         elif event == "-SAVE-":
-            config["enabled"] = values["-ENABLED-"]
             save_config(config)
-            client.config = config
-            log(f"设置已保存: enabled={config['enabled']}")
+            log("设置已保存")
 
         elif event == "-UNPAIR-":
             config["device_token"] = None
