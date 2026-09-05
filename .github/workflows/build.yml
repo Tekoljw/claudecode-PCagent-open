@@ -1,0 +1,47 @@
+name: Build PC Agent
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: agent-windows.exe
+            build_name: agent.exe
+          - os: macos-latest
+            artifact_name: agent-macos
+            build_name: agent
+          - os: ubuntu-latest
+            artifact_name: agent-linux
+            build_name: agent
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: 打包
+        run: pyinstaller --onefile --windowed --name agent agent.py
+
+      - name: 配置 AWS 凭据
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: 上传到 S3
+        run: aws s3 cp dist/${{ matrix.build_name }} s3://${{ secrets.S3_BUCKET }}/latest/${{ matrix.artifact_name }}
