@@ -12,14 +12,11 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact_name: agent-windows.exe
-            build_name: agent.exe
+            artifact_name: agent-windows.zip
           - os: macos-latest
-            artifact_name: agent-macos
-            build_name: agent
+            artifact_name: agent-macos.zip
           - os: ubuntu-latest
-            artifact_name: agent-linux
-            build_name: agent
+            artifact_name: agent-linux.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -33,8 +30,19 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: 打包
-        run: pyinstaller --onefile --windowed --name agent agent.py
+      # onedir 而非 onefile：onefile 在 Windows 上会拆成"引导进程解压临时文件"+
+      # "真正执行代码的子进程"两个进程，两个都各自弹出一个 GUI 窗口（PyInstaller
+      # 6.x 已知问题），onedir 没有这层中间的 bootloader，天然只有一个进程/窗口。
+      - name: 打包（onedir）
+        run: pyinstaller --onedir --windowed --name agent agent.py
+
+      - name: 压缩（Windows）
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path dist/agent -DestinationPath ${{ matrix.artifact_name }}
+
+      - name: 压缩（macOS/Linux）
+        if: runner.os != 'Windows'
+        run: cd dist && zip -r ../${{ matrix.artifact_name }} agent
 
       - name: 配置 AWS 凭据
         uses: aws-actions/configure-aws-credentials@v4
@@ -44,4 +52,4 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: 上传到 S3
-        run: aws s3 cp dist/${{ matrix.build_name }} s3://${{ secrets.S3_BUCKET }}/latest/${{ matrix.artifact_name }}
+        run: aws s3 cp ${{ matrix.artifact_name }} s3://${{ secrets.S3_BUCKET }}/latest/${{ matrix.artifact_name }}

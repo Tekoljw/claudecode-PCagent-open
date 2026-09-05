@@ -313,44 +313,67 @@ class AgentClient:
 #  GUI
 # ─────────────────────────────────────────────────────────────────────────
 
+FONT_TITLE = ("Segoe UI", 16, "bold")
+FONT_SUB = ("Segoe UI", 9)
+FONT_LABEL = ("Segoe UI", 10)
+FONT_BOLD = ("Segoe UI", 10, "bold")
+ACCENT = "#4FC3F7"
+
+
 def create_gui(config):
-    sg.theme("DarkBlue3")
+    sg.theme("DarkGrey13")
+    sg.set_options(font=FONT_LABEL)
     has_token = bool(config.get("device_token"))
 
     pairing_layout = [
-        [sg.Text("首次使用需要配对", font=("Arial", 10, "bold"))],
-        [sg.Text("关联 Bot Token:"), sg.InputText(
-            config.get("bot_token", ""), key="-BOT_TOKEN-", size=(32, 1),
-            tooltip="填入 Telegram Bot Token；验证码会通过它推给管理员")],
-        [sg.Button("获取验证码", key="-GET_CODE-")],
+        [sg.Text("首次使用需要配对", font=FONT_BOLD, pad=((0, 0), (0, 10)))],
+        [sg.Text("关联 Bot Token", font=FONT_SUB, text_color="grey")],
+        [sg.InputText(
+            config.get("bot_token", ""), key="-BOT_TOKEN-", size=(36, 1),
+            tooltip="填入 Telegram Bot Token；验证码会通过它推给管理员",
+            pad=((0, 0), (2, 12)))],
+        [sg.Button("获取验证码", key="-GET_CODE-", size=(14, 1))],
+        [sg.Text("验证码", font=FONT_SUB, text_color="grey", key="-PAIR_CODE_LABEL-",
+                  visible=False, pad=((0, 0), (14, 2)))],
         [
-            sg.Text("验证码:", key="-PAIR_CODE_LABEL-", visible=False),
-            sg.InputText("", key="-PAIR_CODE-", size=(15, 1), visible=False),
-            sg.Button("验证", key="-VERIFY_CODE-", visible=False),
+            sg.InputText("", key="-PAIR_CODE-", size=(16, 1), visible=False),
+            sg.Button("验证", key="-VERIFY_CODE-", size=(8, 1), visible=False),
         ],
-        [sg.Text("", key="-PAIR_STATUS-", text_color="orange", size=(45, 2))],
+        [sg.Text("", key="-PAIR_STATUS-", font=FONT_SUB, text_color=ACCENT,
+                  size=(45, 2), pad=((0, 0), (12, 0)))],
     ]
 
     main_layout = [
-        [sg.Text("PC 名称:"), sg.Text("", key="-PC_NAME-", size=(30, 1))],
-        [sg.Text("状态:"), sg.Text("", key="-STATUS-", size=(30, 1), text_color="red")],
-        [sg.Text("最后心跳:"), sg.Text("", key="-LAST_BEAT-", size=(30, 1))],
+        [sg.Text("PC 名称", font=FONT_SUB, text_color="grey", size=(10, 1)),
+         sg.Push(), sg.Text("", key="-PC_NAME-", font=FONT_LABEL)],
+        [sg.Text("状态", font=FONT_SUB, text_color="grey", size=(10, 1)),
+         sg.Push(),
+         sg.Text("●", key="-STATUS_DOT-", text_color="#E53935", font=("Segoe UI", 12)),
+         sg.Text("", key="-STATUS-", font=FONT_LABEL)],
+        [sg.Text("最后心跳", font=FONT_SUB, text_color="grey", size=(10, 1)),
+         sg.Push(), sg.Text("", key="-LAST_BEAT-", font=FONT_LABEL)],
+        [sg.HSeparator(pad=((0, 0), (14, 12)))],
         [sg.Checkbox("启用远程访问", default=config.get("enabled", True), key="-ENABLED-")],
-        [sg.Button("解除配对", key="-UNPAIR-", tooltip="清除本机令牌，需要重新走验证码配对")],
+        [sg.Button("解除配对", key="-UNPAIR-",
+                    tooltip="清除本机令牌，需要重新走验证码配对", pad=((0, 0), (12, 0)))],
     ]
 
     layout = [
-        [sg.Text("Agent 远程控制客户端", font=("Arial", 14, "bold"))],
-        [sg.HSeparator()],
-        [sg.Text("PC ID:"), sg.Text(get_mac_address(), size=(30, 1))],
-        [sg.HSeparator()],
+        [sg.Text("🖥  Agent", font=FONT_TITLE)],
+        [sg.Text("PC 远程控制客户端", font=FONT_SUB, text_color="grey")],
+        [sg.HSeparator(pad=((0, 0), (14, 14)))],
+        [sg.Text("设备 ID", font=FONT_SUB, text_color="grey", size=(10, 1)),
+         sg.Push(), sg.Text(get_mac_address(), font=FONT_LABEL)],
+        [sg.HSeparator(pad=((0, 0), (14, 14)))],
         [sg.Column(pairing_layout, key="-PAIRING_COL-", visible=not has_token)],
         [sg.Column(main_layout, key="-MAIN_COL-", visible=has_token)],
-        [sg.HSeparator()],
-        [sg.Button("保存设置", key="-SAVE-"), sg.Button("打开日志"), sg.Button("退出")],
+        [sg.HSeparator(pad=((0, 0), (18, 14)))],
+        [sg.Button("保存设置", key="-SAVE-"), sg.Button("打开日志"),
+         sg.Push(), sg.Button("退出", button_color=("white", "#B00020"))],
     ]
 
-    return sg.Window("Agent", layout, finalize=True, keep_on_top=False)
+    return sg.Window("Agent", layout, finalize=True, keep_on_top=False,
+                      margins=(24, 20), element_padding=(4, 4))
 
 
 def main():
@@ -418,7 +441,8 @@ def main():
 
         elif event == "-EVT_STATUS-":
             status, connected = values[event]
-            window["-STATUS-"].update(status, text_color="green" if connected else "red")
+            window["-STATUS-"].update(status)
+            window["-STATUS_DOT-"].update(text_color="#43A047" if connected else "#E53935")
 
         elif event == "-EVT_PCINFO-":
             window["-PC_NAME-"].update(values[event])

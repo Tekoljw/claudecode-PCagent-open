@@ -6,7 +6,9 @@
 ## 下载
 
 从 [Actions](https://github.com/Tekoljw/claudecode-PCagent-open/actions) 对应的构建产物获取，
-或直接联系 Bot 管理员索取下载链接。
+或直接联系 Bot 管理员索取下载链接。下载到的是一个 zip 压缩包，**解压后
+运行文件夹里的 `agent` 程序**（不是单个可执行文件——见下面"打包"一节
+为什么）。
 
 ## 从源码运行
 
@@ -43,10 +45,16 @@ python agent.py
 
 ## 打包
 
+用 `--onedir` 而不是 `--onefile`：onefile 在 Windows 上会拆成"引导进程
+解压临时文件"+"真正执行代码的子进程"两个进程，两个都各自弹出一个 GUI
+窗口（PyInstaller 6.x 已知问题，实测复现过），onedir 没有这层中间的
+bootloader，天然只有一个进程/窗口。代价是产物是一个文件夹，所以 CI
+打包完会压缩成 zip 再发布。
+
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name agent agent.py
+pyinstaller --onedir --windowed --name agent agent.py
 ```
 
 CI（`.github/workflows/build.yml`）会在 push 到 master 时自动为
-Windows / macOS / Linux 三个平台分别构建并发布。
+Windows / macOS / Linux 三个平台分别构建、压缩并发布。
