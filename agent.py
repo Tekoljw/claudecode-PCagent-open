@@ -341,12 +341,12 @@ def create_gui(config):
 
     layout = [
         [sg.Text("Agent 远程控制客户端", font=("Arial", 14, "bold"))],
-        [sg.Separator()],
+        [sg.HSeparator()],
         [sg.Text("PC ID:"), sg.Text(get_mac_address(), size=(30, 1))],
-        [sg.Separator()],
+        [sg.HSeparator()],
         [sg.Column(pairing_layout, key="-PAIRING_COL-", visible=not has_token)],
         [sg.Column(main_layout, key="-MAIN_COL-", visible=has_token)],
-        [sg.Separator()],
+        [sg.HSeparator()],
         [sg.Button("保存设置", key="-SAVE-"), sg.Button("打开日志"), sg.Button("退出")],
     ]
 
