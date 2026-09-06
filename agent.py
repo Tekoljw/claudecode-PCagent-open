@@ -261,6 +261,15 @@ class AgentClient:
                     "output": result["output"],
                 }))
 
+            elif msg_type == "read_memory":
+                req_id = data.get("id")
+                result = read_light_memory()
+                ws.send(json.dumps({
+                    "type": "memory_content",
+                    "id": req_id,
+                    **result,
+                }))
+
             elif msg_type == "ping":
                 ws.send(json.dumps({"type": "pong"}))
 
@@ -531,6 +540,22 @@ def get_app_dir():
 
 LIGHT_DEVICES_FILE = get_app_dir() / "light_devices.json"
 LIGHT_DMX_STATE_FILE = get_app_dir() / "light_dmx_state.json"
+
+# 声光同步网页生成的"记忆文件"——设备白话定义 + 素材说明，喂给 Claude Code 编灯用。
+# 跟 exe 同目录，网页那边把文件写到这里（写入方式待网页真正接入本地文件系统时再定，
+# 这里只负责读）。文件不存在是正常状态（用户还没在网页里点过"生成记忆文件"），不是错误。
+LIGHT_MEMORY_FILE = get_app_dir() / "light_library_memory.json"
+
+
+def read_light_memory():
+    try:
+        if not LIGHT_MEMORY_FILE.exists():
+            return {"exists": False, "content": None, "error": None}
+        with open(LIGHT_MEMORY_FILE, "r", encoding="utf-8") as f:
+            content = json.load(f)
+        return {"exists": True, "content": content, "error": None}
+    except Exception as e:
+        return {"exists": False, "content": None, "error": str(e)}
 
 
 def load_light_devices():
