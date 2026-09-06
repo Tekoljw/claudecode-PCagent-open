@@ -20,11 +20,13 @@ python agent.py
 ## 首次使用：配对
 
 1. 启动后，界面显示这台设备的 ID（MAC 地址）
-2. 填入要绑定的 Telegram Bot Token
-3. 点击「获取验证码」
-4. 去 Telegram 查看 Bot 推送的验证码（1 小时内有效）
-5. 把验证码填回界面，点击「验证」
-6. 配对成功后自动进入工作界面，之后每次启动自动连接，无需再操作
+2. 点击「获取验证码」
+3. 去 Telegram 查看管理员收到的验证码推送（1 小时内有效）
+4. 把验证码填回界面，点击「验证」
+5. 配对成功后自动进入工作界面，之后每次启动自动连接，无需再操作
+
+配对完成后，这台设备归哪个 Bot 管理是服务端的事——管理员在 Telegram 里
+的设备列表中手动绑定，客户端不需要也无法指定。
 
 ## 认证模型
 
@@ -34,8 +36,30 @@ python agent.py
 
 ## 权限说明
 
-一台设备可以绑定一个 Bot（配对时指定）。绑定后，只有这个 Bot 能对它下发命令，
-其他 Bot 无权操作。未绑定时任意 Bot 可操作。
+一台设备可以绑定一个 Bot（配对完成后由管理员在服务端指定）。绑定后，只有这个
+Bot 能对它下发命令，其他 Bot 无权操作。未绑定时任意 Bot 可操作。
+
+## USB 灯光控制（MIDI / DMX）
+
+同一个 `agent` 程序额外支持一个 `light` 子命令，用来操控这台电脑上通过 USB
+连接的灯光设备。不是新协议——Bot 本来就能把任意 shell 命令送到这台电脑执行，
+`light` 只是让程序被这样调用时执行完就退出，不进入 GUI：
+
+```bash
+agent light list                                                    # 列出可用 MIDI 端口 / 串口设备
+agent light midi --device 金刚台 --type note_on --note 60 --velocity 100
+agent light dmx  --device 白色台子 --set 1=255 --set 2=128          # Enttec DMX USB Pro 协议
+```
+
+`--device` 可以直接写 MIDI 端口名子串/索引或 COM 口，也可以是跟程序同目录的
+`light_devices.json` 里配置的别名（先跑 `light list` 现场核对设备名，再填写）：
+
+```json
+{
+  "金刚台":   { "type": "midi", "port_name": "USB MIDI Device" },
+  "白色台子": { "type": "dmx",  "com_port": "COM3", "baudrate": 57600 }
+}
+```
 
 ## 隐私与安全
 
@@ -53,8 +77,12 @@ bootloader，天然只有一个进程/窗口。代价是产物是一个文件夹
 
 ```bash
 pip install pyinstaller
-pyinstaller --onedir --windowed --name agent agent.py
+pyinstaller --onedir --windowed --name agent --collect-all rtmidi --hidden-import=serial.tools.list_ports agent.py
 ```
+
+`--collect-all rtmidi` 是因为 `python-rtmidi`（灯光控制用到）是 C 扩展，
+PyInstaller 静态分析常漏掉其原生绑定。Linux 上从源码构建它还需要系统装
+`libasound2-dev`（CI 已处理，本地在 Linux 上打包需要自己先装）。
 
 CI（`.github/workflows/build.yml`）会在 push 到 master 时自动为
 Windows / macOS / Linux 三个平台分别构建、压缩并发布。

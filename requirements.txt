@@ -1,2 +1,4 @@
 FreeSimpleGUI==5.1.0
 websocket-client==1.6.4
+python-rtmidi==1.5.8
+pyserial==3.5

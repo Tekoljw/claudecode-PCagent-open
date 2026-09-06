@@ -42,7 +42,9 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE = CONFIG_DIR / "agent.log"
 
 DEFAULT_CONFIG = {
-    # Agent 走 wss://<server_host>/agent 连接服务器。
+    # 复用 claude-bot 现有的 CloudFront 域名和 Mini App 路径，
+    # Agent 走 wss://claudbotjs.doez.ai/agent，不需要单独的域名/证书/端口。
+    # （旧域名 claudebot.bc361.com 过渡期内仍保留，见 CLAUDE.md）
     "server_host": "claudbotjs.doez.ai",
     "server_port": 443,
     "device_token": None,  # 配对成功后颁发，本机专属，不要跟其他设备共用
@@ -502,5 +504,230 @@ def main():
     log("Agent 退出")
 
 
+# ─────────────────────────────────────────────────────────────────────────
+#  USB 灯光控制（MIDI / DMX）—— 供远程通过 shell 命令调用，不进 GUI 主循环
+#
+#  不走 WebSocket 新协议：远程侧（Claude Code 的 pc_exec MCP 工具，或 Telegram
+#  /pc_cmd）本来就能把任意 shell 命令送到这台 PC 执行（agent.py 已有的
+#  execute_command() 用 subprocess.run 跑），这里只是把同一个 exe 变成一个
+#  "被调用时执行完就退出"的 CLI 工具，复用现成的命令通道，不新增协议。
+#
+#  调用方式（同一个 agent.exe，用子命令分流）：
+#    agent.exe light list
+#    agent.exe light midi --device 金刚台 --type note_on --note 60 --velocity 100
+#    agent.exe light dmx  --device 白色台子 --set 1=255 --set 2=128
+# ─────────────────────────────────────────────────────────────────────────
+
+DMX_CHANNELS = 512
+
+
+def get_app_dir():
+    """打包成 exe 后用 exe 所在目录；直接跑 .py 时用脚本所在目录——
+    不能用 Path.cwd()，双击启动时工作目录不一定是安装目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+LIGHT_DEVICES_FILE = get_app_dir() / "light_devices.json"
+LIGHT_DMX_STATE_FILE = get_app_dir() / "light_dmx_state.json"
+
+
+def load_light_devices():
+    """读取设备别名映射表（跟 exe 同目录，方便现场手动编辑）：
+    {"金刚台": {"type":"midi","port_name":"USB MIDI Device"},
+     "白色台子": {"type":"dmx","com_port":"COM3","baudrate":57600}}
+    文件不存在时返回空表——先跑 `light list` 现场核对可用设备，再手填这个文件。"""
+    try:
+        if LIGHT_DEVICES_FILE.exists():
+            with open(LIGHT_DEVICES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log(f"读取 light_devices.json 失败: {e}")
+    return {}
+
+
+def light_list_devices():
+    """列出系统当前识别到的 MIDI 端口和串口设备，供现场核对、填写别名表。"""
+    result = {"midi_ports": [], "serial_ports": [], "configured_aliases": load_light_devices()}
+    try:
+        import rtmidi
+        midiout = rtmidi.MidiOut()
+        result["midi_ports"] = midiout.get_ports()
+    except Exception as e:
+        result["midi_error"] = str(e)
+    try:
+        import serial.tools.list_ports
+        result["serial_ports"] = [
+            {"device": p.device, "description": p.description}
+            for p in serial.tools.list_ports.comports()
+        ]
+    except Exception as e:
+        result["serial_error"] = str(e)
+    return result
+
+
+def send_midi_message(device_arg, msg_type, channel, note=None, velocity=100, controller=None, value=None):
+    """device_arg：light_devices.json 里的别名（type 必须是 midi），或直接的端口名子串/端口索引。"""
+    import rtmidi
+
+    devices = load_light_devices()
+    entry = devices.get(device_arg)
+    port_name = entry["port_name"] if entry and entry.get("type") == "midi" else device_arg
+
+    midiout = rtmidi.MidiOut()
+    ports = midiout.get_ports()
+    idx = None
+    if port_name.isdigit():
+        idx = int(port_name)
+    else:
+        for i, p in enumerate(ports):
+            if port_name in p:
+                idx = i
+                break
+    if idx is None or idx >= len(ports):
+        raise RuntimeError(f"未找到 MIDI 端口: {port_name}（当前可用: {ports}）")
+
+    midiout.open_port(idx)
+    try:
+        channel = channel & 0x0F
+        if msg_type == "note_on":
+            if note is None:
+                raise ValueError("note_on 需要 --note")
+            midiout.send_message([0x90 | channel, note & 0x7F, (velocity or 0) & 0x7F])
+        elif msg_type == "note_off":
+            if note is None:
+                raise ValueError("note_off 需要 --note")
+            midiout.send_message([0x80 | channel, note & 0x7F, 0])
+        elif msg_type == "cc":
+            if controller is None or value is None:
+                raise ValueError("cc 需要 --controller 和 --value")
+            midiout.send_message([0xB0 | channel, controller & 0x7F, value & 0x7F])
+        else:
+            raise ValueError(f"未知 MIDI 消息类型: {msg_type}")
+    finally:
+        midiout.close_port()
+    return {"port": ports[idx]}
+
+
+def _load_dmx_frame():
+    try:
+        if LIGHT_DMX_STATE_FILE.exists():
+            with open(LIGHT_DMX_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            frame = bytearray(DMX_CHANNELS)
+            for i, v in enumerate(data.get("frame", [])[:DMX_CHANNELS]):
+                frame[i] = v & 0xFF
+            return frame
+    except Exception as e:
+        log(f"读取 DMX 状态失败: {e}")
+    return bytearray(DMX_CHANNELS)
+
+
+def _save_dmx_frame(frame):
+    try:
+        with open(LIGHT_DMX_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"frame": list(frame)}, f)
+    except Exception as e:
+        log(f"保存 DMX 状态失败: {e}")
+
+
+def send_dmx_frame(device_arg, channel_updates):
+    """device_arg：light_devices.json 里的别名（type 必须是 dmx），或直接的 COM 口。
+    Enttec DMX USB Pro 协议（USB-DMX 适配器最常见的协议）：
+      0x7E, label=6(Output Only Send DMX Packet), len_lo, len_hi,
+      [0x00 start-code, ch1..ch512], 0xE7
+    DMX 是全量帧协议——只改一两个通道也要发满 512 字节，所以本地维护一份帧状态文件，
+    每次只更新其中几个通道后仍整帧发送。
+    波特率因适配器而异，常见 57600，若现场设备无响应就在 light_devices.json 里加
+    "baudrate" 字段试其他值（比如 250000）——这个值没法在没有实体设备的情况下确定。"""
+    import serial
+
+    devices = load_light_devices()
+    entry = devices.get(device_arg)
+    if entry and entry.get("type") == "dmx":
+        com_port = entry["com_port"]
+        baudrate = entry.get("baudrate", 57600)
+    else:
+        com_port = device_arg
+        baudrate = 57600
+
+    frame = _load_dmx_frame()
+    for ch, val in channel_updates.items():
+        ch = int(ch)
+        if not (1 <= ch <= DMX_CHANNELS):
+            raise ValueError(f"DMX 通道号超出范围(1-512): {ch}")
+        frame[ch - 1] = int(val) & 0xFF
+    _save_dmx_frame(frame)
+
+    payload = bytes([0]) + bytes(frame)  # 0x00 start code + 512 通道
+    length = len(payload)
+    packet = bytes([0x7E, 6, length & 0xFF, (length >> 8) & 0xFF]) + payload + bytes([0xE7])
+
+    with serial.Serial(com_port, baudrate=baudrate, timeout=2) as ser:
+        ser.write(packet)
+    return {"port": com_port, "baudrate": baudrate, "channels_updated": len(channel_updates)}
+
+
+def run_light_cli(argv):
+    """`agent.exe light ...` 的入口。返回进程退出码。"""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="agent.exe light", add_help=True)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list", help="列出可用的 MIDI 端口和串口设备")
+
+    p_midi = sub.add_parser("midi", help="发送 MIDI 消息")
+    p_midi.add_argument("--device", required=True, help="light_devices.json 别名，或 MIDI 端口名子串/索引")
+    p_midi.add_argument("--type", required=True, choices=["note_on", "note_off", "cc"])
+    p_midi.add_argument("--channel", type=int, default=0)
+    p_midi.add_argument("--note", type=int)
+    p_midi.add_argument("--velocity", type=int, default=100)
+    p_midi.add_argument("--controller", type=int)
+    p_midi.add_argument("--value", type=int)
+
+    p_dmx = sub.add_parser("dmx", help="发送 DMX 数据（Enttec DMX USB Pro 协议）")
+    p_dmx.add_argument("--device", required=True, help="light_devices.json 别名，或 COM 口")
+    p_dmx.add_argument("--set", action="append", required=True, metavar="CH=VAL",
+                        help="通道=数值，可重复，如 --set 1=255 --set 2=128")
+
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 2
+
+    try:
+        if args.cmd == "list":
+            result = {"success": True, **light_list_devices()}
+        elif args.cmd == "midi":
+            info = send_midi_message(args.device, args.type, args.channel,
+                                      note=args.note, velocity=args.velocity,
+                                      controller=args.controller, value=args.value)
+            result = {"success": True, **info}
+        elif args.cmd == "dmx":
+            updates = {}
+            for item in args.set:
+                if "=" not in item:
+                    raise ValueError(f"--set 参数格式应为 通道=数值，收到: {item}")
+                ch, val = item.split("=", 1)
+                updates[int(ch)] = int(val)
+            info = send_dmx_frame(args.device, updates)
+            result = {"success": True, **info}
+        else:
+            result = {"success": False, "error": f"未知子命令: {args.cmd}"}
+    except Exception as e:
+        result = {"success": False, "error": str(e)}
+
+    try:
+        print(json.dumps(result, ensure_ascii=False))
+    except Exception:
+        pass  # 防御：极端情况下 stdout 不可写也不影响退出码
+    return 0 if result.get("success") else 1
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "light":
+        sys.exit(run_light_cli(sys.argv[2:]))
+    else:
+        main()

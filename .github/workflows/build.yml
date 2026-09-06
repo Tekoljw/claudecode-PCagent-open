@@ -25,6 +25,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      # python-rtmidi 在 Linux 上要从源码编译，需要 ALSA 开发头文件，
+      # 否则 pip install 直接失败（Windows/macOS 有预编译 wheel，不需要这步）。
+      - name: 安装系统依赖（Linux，python-rtmidi 编译需要 ALSA 头文件）
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
       - name: 安装依赖
         run: |
           pip install -r requirements.txt
@@ -33,8 +39,10 @@ jobs:
       # onedir 而非 onefile：onefile 在 Windows 上会拆成"引导进程解压临时文件"+
       # "真正执行代码的子进程"两个进程，两个都各自弹出一个 GUI 窗口（PyInstaller
       # 6.x 已知问题），onedir 没有这层中间的 bootloader，天然只有一个进程/窗口。
+      # --collect-all rtmidi：python-rtmidi 是 C 扩展，PyInstaller 静态分析常漏掉
+      # 其原生绑定，不显式收集打包出来的 exe 会在运行时报模块缺失。
       - name: 打包（onedir）
-        run: pyinstaller --onedir --windowed --name agent agent.py
+        run: pyinstaller --onedir --windowed --name agent --collect-all rtmidi --hidden-import=serial.tools.list_ports agent.py
 
       - name: 压缩（Windows）
         if: runner.os == 'Windows'
