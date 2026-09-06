@@ -19,6 +19,8 @@ import socket
 import os
 import subprocess
 import platform
+import sqlite3
+import base64
 from pathlib import Path
 import websocket
 
@@ -268,6 +270,32 @@ class AgentClient:
                     "type": "memory_content",
                     "id": req_id,
                     **result,
+                }))
+
+            elif msg_type == "write_memory":
+                req_id = data.get("id")
+                result = write_light_memory(data.get("content"))
+                ws.send(json.dumps({
+                    "type": "memory_write_result",
+                    "id": req_id,
+                    **result,
+                }))
+
+            elif msg_type == "scan_devices":
+                req_id = data.get("id")
+                # 复用 light_list_devices()（`agent.exe light list` CLI 子命令用的同一个函数）
+                # 而不是另写一遍枚举逻辑——只是给用户看这台 PC 实际接了什么，不自动生成
+                # 灯具型号定义，型号跟物理端口的对应关系仍靠人工在 light_devices.json 里维护。
+                scan = light_list_devices()
+                ws.send(json.dumps({
+                    "type": "scan_result",
+                    "id": req_id,
+                    "ok": True,
+                    "devices": {
+                        "midi": scan.get("midi_ports", []),
+                        "serial": scan.get("serial_ports", []),
+                    },
+                    "error": scan.get("midi_error") or scan.get("serial_error"),
                 }))
 
             elif msg_type == "ping":
@@ -541,21 +569,131 @@ def get_app_dir():
 LIGHT_DEVICES_FILE = get_app_dir() / "light_devices.json"
 LIGHT_DMX_STATE_FILE = get_app_dir() / "light_dmx_state.json"
 
-# 声光同步网页生成的"记忆文件"——设备白话定义 + 素材说明，喂给 Claude Code 编灯用。
-# 跟 exe 同目录，网页那边把文件写到这里（写入方式待网页真正接入本地文件系统时再定，
-# 这里只负责读）。文件不存在是正常状态（用户还没在网页里点过"生成记忆文件"），不是错误。
-LIGHT_MEMORY_FILE = get_app_dir() / "light_library_memory.json"
+# 声光同步网页（/lightsync 远程控制端）编辑的"灯光库"——设备白话定义 + 素材说明，
+# 喂给 Claude Code 编灯用。这台 PC 是真实数据源（不是原来的 light_library_memory.json
+# 那个平文件，云端 lib/db.js 的 light_library_cache 只是这份数据成功写入后的只读镜像，
+# 见 lib/miniapp.js 的 /api/light/save-library）。跟 exe 同目录，单例 SQLite 文件。
+LIGHT_LIBRARY_DB_FILE = get_app_dir() / "light_library.db"
+
+
+def _light_library_db():
+    conn = sqlite3.connect(str(LIGHT_LIBRARY_DB_FILE))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS light_library (
+            id                      INTEGER PRIMARY KEY CHECK (id = 1),
+            generated_at            TEXT,
+            prompt_for_claude_code  TEXT,
+            venue_fixtures_json     TEXT NOT NULL DEFAULT '[]',
+            updated_at              TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS light_reference_media (
+            slot        TEXT PRIMARY KEY,
+            label       TEXT,
+            kind        TEXT,
+            file_name   TEXT,
+            data        BLOB,
+            note        TEXT,
+            updated_at  TEXT
+        )
+    """)
+    return conn
+
+
+def _data_url_to_bytes(data_url):
+    """'data:image/jpeg;base64,xxxx' -> 原始字节。不是 data URL（没有逗号）就返回 None。"""
+    if not data_url or "," not in data_url:
+        return None
+    return base64.b64decode(data_url.split(",", 1)[1])
+
+
+def _bytes_to_data_url(raw, kind):
+    if raw is None:
+        return None
+    mime = "video/mp4" if kind == "video" else "image/jpeg"
+    return f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
 
 
 def read_light_memory():
+    """返回形状特意保持跟原来读文件版一样：{exists, content, error}——
+    这样 agent-server.js 的 readMemory、pc-mcp-server.js 的 formatMemoryNote() 都不用改。"""
     try:
-        if not LIGHT_MEMORY_FILE.exists():
-            return {"exists": False, "content": None, "error": None}
-        with open(LIGHT_MEMORY_FILE, "r", encoding="utf-8") as f:
-            content = json.load(f)
-        return {"exists": True, "content": content, "error": None}
+        conn = _light_library_db()
+        try:
+            row = conn.execute(
+                "SELECT generated_at, prompt_for_claude_code, venue_fixtures_json FROM light_library WHERE id = 1"
+            ).fetchone()
+            if not row:
+                return {"exists": False, "content": None, "error": None}
+
+            media = {}
+            for slot, label, kind, file_name, data, note in conn.execute(
+                "SELECT slot, label, kind, file_name, data, note FROM light_reference_media"
+            ):
+                media[slot] = {
+                    "label": label,
+                    "kind": kind,
+                    "fileName": file_name,
+                    "dataUrl": _bytes_to_data_url(data, kind) if kind == "image" else None,
+                    "note": note,
+                }
+            for slot in ("front", "left", "right", "frontWide", "video30s"):
+                media.setdefault(slot, None)
+
+            content = {
+                "generatedAt": row[0],
+                "promptForClaudeCode": row[1],
+                "venueFixtures": json.loads(row[2] or "[]"),
+                "venueReferenceMedia": media,
+            }
+            return {"exists": True, "content": content, "error": None}
+        finally:
+            conn.close()
     except Exception as e:
         return {"exists": False, "content": None, "error": str(e)}
+
+
+def write_light_memory(content):
+    try:
+        content = content or {}
+        conn = _light_library_db()
+        try:
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            conn.execute(
+                "INSERT INTO light_library (id, generated_at, prompt_for_claude_code, venue_fixtures_json, updated_at) "
+                "VALUES (1, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET generated_at=excluded.generated_at, "
+                "  prompt_for_claude_code=excluded.prompt_for_claude_code, "
+                "  venue_fixtures_json=excluded.venue_fixtures_json, updated_at=excluded.updated_at",
+                (
+                    content.get("generatedAt"),
+                    content.get("promptForClaudeCode"),
+                    json.dumps(content.get("venueFixtures", []), ensure_ascii=False),
+                    now,
+                ),
+            )
+
+            media = content.get("venueReferenceMedia") or {}
+            for slot in ("front", "left", "right", "frontWide", "video30s"):
+                asset = media.get(slot)
+                if not asset:
+                    conn.execute("DELETE FROM light_reference_media WHERE slot = ?", (slot,))
+                    continue
+                raw = _data_url_to_bytes(asset.get("dataUrl")) if asset.get("kind") == "image" else None
+                conn.execute(
+                    "INSERT INTO light_reference_media (slot, label, kind, file_name, data, note, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(slot) DO UPDATE SET label=excluded.label, kind=excluded.kind, "
+                    "  file_name=excluded.file_name, data=excluded.data, note=excluded.note, updated_at=excluded.updated_at",
+                    (slot, asset.get("label"), asset.get("kind"), asset.get("fileName"), raw, asset.get("note"), now),
+                )
+            conn.commit()
+            return {"ok": True, "error": None}
+        finally:
+            conn.close()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def load_light_devices():
