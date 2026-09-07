@@ -39,6 +39,11 @@ except ImportError:
 #  配置
 # ─────────────────────────────────────────────────────────────────────────
 
+# 手工维护，没有自动生成机制——改了行为就顺手加一位，方便排查"用户手上跑的是不是
+# 最新版"（2026-09-07 实锤过：CI 每次都覆盖 S3 上的 latest 包，此前完全没有版本号，
+# 没法确认运行中的 exe 对应哪次提交）。GUI 标题栏和主界面都会显示这个值。
+__version__ = "1.1.0"
+
 CONFIG_DIR = Path.home() / ".claude-agent"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE = CONFIG_DIR / "agent.log"
@@ -315,12 +320,17 @@ class AgentClient:
         self.authenticated = False
         self._cb("on_status_change", "已断开", False)
         if close_status_code == 4001:
-            # 认证失败：device_token 被吊销或错误，清空本地令牌，转回配对界面
+            # 认证失败：device_token 被吊销或错误，清空本地令牌，转回配对界面。
+            # 2026-09-07 实锤故障：这里之前直接 return，连接从此断死不再重连——
+            # 用户点"获取验证码"时 self.connected 恒为 False，按钮静默无效，
+            # 只能整个重启程序才能恢复。清空令牌后必须立刻重新建一条干净连接
+            # （不带 device_token，on_open 就不会再触发 auth，不会死循环），
+            # "获取验证码"才有连接可用。这不是网络故障，不占用重连退避计数。
             log("认证被拒绝，可能已被吊销，清空本地配对信息")
             self.config["device_token"] = None
             save_config(self.config)
             self._cb("on_auth_revoked")
-            return
+            self.reconnect_count = 0
         self.reconnect()
 
     def execute_command(self, cmd):
@@ -413,7 +423,8 @@ def create_gui(config):
 
     layout = [
         [sg.Text("🖥  Agent", font=FONT_TITLE)],
-        [sg.Text("PC 远程控制客户端", font=FONT_SUB, text_color="grey")],
+        [sg.Text("PC 远程控制客户端", font=FONT_SUB, text_color="grey"),
+         sg.Push(), sg.Text(f"v{__version__}", font=FONT_SUB, text_color="grey")],
         [sg.HSeparator(pad=((0, 0), (14, 14)))],
         [sg.Text("设备 ID", font=FONT_SUB, text_color="grey", size=(10, 1)),
          sg.Push(), sg.Text(get_mac_address(), font=FONT_LABEL)],
@@ -425,12 +436,12 @@ def create_gui(config):
          sg.Push(), sg.Button("退出", button_color=("white", "#B00020"))],
     ]
 
-    return sg.Window("Agent", layout, finalize=True, keep_on_top=False,
+    return sg.Window(f"Agent v{__version__}", layout, finalize=True, keep_on_top=False,
                       margins=(24, 20), element_padding=(4, 4))
 
 
 def main():
-    log("Agent 启动")
+    log(f"Agent 启动 v{__version__}")
     config = load_config()
 
     window = create_gui(config)
