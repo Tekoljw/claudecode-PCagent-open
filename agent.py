@@ -42,7 +42,7 @@ except ImportError:
 # 手工维护，没有自动生成机制——改了行为就顺手加一位，方便排查"用户手上跑的是不是
 # 最新版"（2026-09-07 实锤过：CI 每次都覆盖 S3 上的 latest 包，此前完全没有版本号，
 # 没法确认运行中的 exe 对应哪次提交）。GUI 标题栏和主界面都会显示这个值。
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 CONFIG_DIR = Path.home() / ".claude-agent"
 CONFIG_FILE = CONFIG_DIR / "config.json"
