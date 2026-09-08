@@ -175,7 +175,13 @@ class AgentClient:
                 on_open=self.on_open,
             )
             self.ws = ws
-            ws.run_forever()
+            # ping_interval/ping_timeout 不能省：CloudFront 对空闲连接有默认 60 秒左右
+            # 的超时，中间人（CloudFront/路由器/NAT）可能早就把连接悄悄断了，但本地
+            # socket 在收到明确的 RST/FIN 之前会一直显示"已连接"——没有心跳包，客户端
+            # 可能永远发现不了连接已经死了（2026-09-08 实锤：GUI 显示已连接，服务端
+            # 数天没收到任何流量，`last_seen` 停在很早之前，判定离线）。25/10 秒留出
+            # 足够余量，一旦探测失败会触发 on_close，走已有的 reconnect() 重新连上。
+            ws.run_forever(ping_interval=25, ping_timeout=10)
         except Exception as e:
             log(f"连接失败: {e}")
             self.connected = False
