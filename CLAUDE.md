@@ -32,9 +32,10 @@ bot 服务端代码，改了必须重启 bot 才生效，混在一起会让"这�
 ## 架构
 
 单文件 `agent.py`：`websocket-client` 连到 `wss://claudbotjs.doez.ai/agent`
-（跟 claude-code-AI 的 Mini App 共用同一个 CloudFront 分发/端口），验证码配对 +
-设备专属 token 认证，收到 `command` 消息就用 `subprocess.run` 本地执行并回传结果。
-另外内置一套"灯光库"能力，供现场灯光控制使用：
+（跟 claude-code-AI 的 Mini App 共用同一个 CloudFront 分发/端口）。2026-09-14 起
+认证零持久化：每次连接（首次或任意一次重连）都要重新走一遍验证码流程，不保存
+任何 token，断线没有"记住我"。校验通过后收到 `command` 消息就用 `subprocess.run`
+本地执行并回传结果。另外内置一套"灯光库"能力，供现场灯光控制使用：
 
 - **USB 灯光控制**（`run_light_cli`/`send_midi_message`/`send_dmx_frame`）：
   `agent.exe light list|midi|dmx` 命令行子命令，通过 `python-rtmidi`/`pyserial`
