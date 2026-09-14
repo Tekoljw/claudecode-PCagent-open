@@ -59,5 +59,12 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      # --cache-control 明确禁止浏览器/中间代理复用旧响应体——不加这个参数，S3
+      # 默认不会带任何 Cache-Control 头，缓存多久完全交给各浏览器自己的"经验公式"
+      # 猜（heuristic caching），行为不可控。2026-09-14 实锤：用户重新下载了好几次
+      # 依然拿到 6 天前的旧版本（浏览器本地缓存条目没有按预期过期），加上这个头
+      # 彻底消除这个不确定性。
       - name: 上传到 S3
-        run: aws s3 cp ${{ matrix.artifact_name }} s3://${{ secrets.S3_BUCKET }}/latest/${{ matrix.artifact_name }}
+        run: >
+          aws s3 cp ${{ matrix.artifact_name }} s3://${{ secrets.S3_BUCKET }}/latest/${{ matrix.artifact_name }}
+          --cache-control "no-cache, no-store, must-revalidate"
