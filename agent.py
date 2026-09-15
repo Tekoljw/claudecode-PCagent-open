@@ -3,17 +3,24 @@
 PC 远程控制 Agent - 跨平台（Windows/macOS/Linux）
 运行方式：python agent.py 或双击可执行文件
 
-认证模型（2026-09-14 起，零持久化）：本机不保存任何可复用的长期凭证。
-- 每次使用（首次或任意一次重连）：点击"获取验证码"，服务器把验证码推给
-  Telegram 里的管理员，1 小时内有效。把验证码填回这里完成配对——校验通过
-  即建立本次连接，服务端不签发任何 token，本机也不保存任何东西。
-- 只要断线（网络波动、服务重启、程序重开……任何原因），就必须重新走一遍
-  这个流程——没有"记住我"，没有自动重连到已认证状态。这不是遗漏，是设计：
-  服务端对 PC 零持久化，没有状态可以"记住"。配对成功后由哪个 Bot 管理这台
-  设备，是服务端的管理员决定的事（在 /pc_list 里绑定），客户端无需也无法指定。
-- "已连接"在界面上代表真实的端到端连通——不是握手成功就亮绿灯，而是持续
-  收到服务端消息（心跳/pc_info 等）才算，超过一段时间没收到任何消息会自动
-  判定连接已死，切回未连接状态（见 last_server_seen 相关逻辑）。
+认证模型（2026-09-16 起，第二版：密钥持久化，Bot 不是权限维度）：
+- 服务端/数据库对 PC 本身仍然零持久化（不存 MAC/hostname 这类"设备身份"）；
+  但每台客户端持有一把服务端签发的强密钥（不是弱验证码），这把密钥归属于
+  某个 operator（不是某个 Bot——Bot 在这套模型里完全不是权限维度）。
+- 管理员在 Telegram 里用 /pc_newkey 生成密钥，推一条消息给对应的人（那条
+  消息 5 分钟后自动撤回），把密钥粘贴进这里的"密钥"输入框，保存后**加密**
+  存本地（见 encrypt_key/decrypt_key，本机专属的对称密钥单独存一个文件，
+  拷走 config.json 本身解不开）。
+- 之后每次启动直接用保存的密钥连接，不需要人工干预；断线（网络波动、
+  服务端重启……任何原因）会无限自动重连，直到用户手动勾掉"启用远程连接"
+  或退出程序——不会像上一版那样每次断线都要重新走一遍人工流程。
+- 密钥被管理员吊销后，服务端会在一轮心跳内主动断开这条连接，此后自动重连
+  会不断失败（服务端拒绝这把已吊销的密钥）；界面上会看到反复"连接被拒绝"，
+  这时需要联系管理员要一把新密钥，用"更换密钥"重新粘贴。
+- 每条下发的命令都带着真实发起人的 Telegram 用户 ID（和"是不是 owner"这个
+  服务端算好的标记）：客户端自己也会核对一遍——只有这把密钥的 operator 本人
+  或 owner 的命令才会真的执行，这是跟服务端路由校验并列的第二道硬卡，
+  不是只信任传输链路。
 """
 
 import sys
@@ -36,7 +43,13 @@ try:
     # 保持 4.x 最后一个开源版本的 LGPL 协议，API 完全兼容，一行 import 切换。
     import FreeSimpleGUI as sg
 except ImportError:
-    print("需要安装依赖: pip install FreeSimpleGUI websocket-client")
+    print("需要安装依赖: pip install -r requirements.txt")
+    sys.exit(1)
+
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+except ImportError:
+    print("需要安装依赖: pip install -r requirements.txt（缺 cryptography，密钥加密存储要用）")
     sys.exit(1)
 
 
@@ -47,17 +60,21 @@ except ImportError:
 # 手工维护，没有自动生成机制——改了行为就顺手加一位，方便排查"用户手上跑的是不是
 # 最新版"（2026-09-07 实锤过：CI 每次都覆盖 S3 上的 latest 包，此前完全没有版本号，
 # 没法确认运行中的 exe 对应哪次提交）。GUI 标题栏和主界面都会显示这个值。
-# 2026-09-14：零持久化重写，协议破坏性变更（旧版的 auth/device_token 服务端已不再
-# 认识），直接跳到 2.0.0 而不是常规补丁级递增。
-__version__ = "2.0.0"
+# 2026-09-16：密钥持久化重写，协议再次破坏性变更（旧版的 verify_pairing_code
+# 服务端已不再认识），跳到 3.0.0。
+__version__ = "3.0.0"
 
 CONFIG_DIR = Path.home() / ".claude-agent"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE = CONFIG_DIR / "agent.log"
+# 本机专属的对称加密密钥，单独存一个文件——只用来加密/解密 config.json 里的
+# 那把服务端密钥，不随 config.json 一起分享/拷贝就解不开，防止简单地复制
+# config.json 就能在另一台机器上冒充这台设备连接。
+LOCAL_KEYFILE = CONFIG_DIR / ".local.key"
 
 # 心跳判活：超过这么久没收到服务端任何消息，就主动判定连接已死（不能只靠收到一次
-# pc_info 就永远显示绿色）。服务端心跳间隔 30 秒，这里留 2.5 倍余量。
-HEARTBEAT_STALE_SECS = 75
+# pc_info 就永远显示绿色）。服务端心跳间隔 15 秒，这里留约 3 倍余量。
+HEARTBEAT_STALE_SECS = 45
 
 DEFAULT_CONFIG = {
     # 复用 claude-bot 现有的 CloudFront 域名和 Mini App 路径，
@@ -65,17 +82,9 @@ DEFAULT_CONFIG = {
     # （旧域名 claudebot.bc361.com 过渡期内仍保留，见 CLAUDE.md）
     "server_host": "claudbotjs.doez.ai",
     "server_port": 443,
-    "name": None,   # 本机展示名，留空时用 hostname；服务端只读展示，不做修改
+    "name": None,       # 本机展示名，留空时用 hostname；服务端只读展示，不做修改
+    "key_enc": None,    # 服务端签发的密钥，加密后存这里；明文密钥只活在内存里
     "enabled": True,
-}
-
-PAIRING_FAIL_REASONS = {
-    "not_found": "验证码不存在",
-    "expired": "验证码已过期，请重新获取",
-    "used": "验证码已被使用，请重新获取",
-    "mac_mismatch": "验证码错误",
-    "too_many_attempts": "错误次数过多，请重新获取验证码",
-    "error": "服务器内部错误",
 }
 
 
@@ -94,14 +103,6 @@ def log(msg):
             f.write(log_msg + "\n")
     except Exception:
         pass
-
-
-def get_mac_address():
-    """获取 MAC 地址"""
-    import uuid
-    mac = uuid.getnode()
-    mac_str = ':'.join(("%012X" % mac)[i:i+2] for i in range(0, 12, 2))
-    return mac_str
 
 
 def get_hostname():
@@ -134,6 +135,34 @@ def save_config(config):
         log(f"保存配置失败: {e}")
 
 
+def _local_fernet():
+    """本机专属的加解密器——密钥文件第一次用到时生成，此后固定不变。
+    单独存放、权限收紧到仅本用户可读，跟 config.json 分开，拷走 config.json
+    本身不含解密所需的东西。"""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not LOCAL_KEYFILE.exists():
+        LOCAL_KEYFILE.write_bytes(Fernet.generate_key())
+        try:
+            os.chmod(LOCAL_KEYFILE, 0o600)
+        except Exception:
+            pass  # Windows 上 chmod 效果有限，但不影响功能，只是纵深防御的一层
+    return Fernet(LOCAL_KEYFILE.read_bytes())
+
+
+def encrypt_key(plain_key):
+    return _local_fernet().encrypt(plain_key.strip().encode("utf-8")).decode("ascii")
+
+
+def decrypt_key(token):
+    if not token:
+        return None
+    try:
+        return _local_fernet().decrypt(token.encode("ascii")).decode("utf-8")
+    except (InvalidToken, Exception) as e:
+        log(f"解密本地密钥失败（本地密钥文件可能被换过/损坏）: {e}")
+        return None
+
+
 # ─────────────────────────────────────────────────────────────────────────
 #  WebSocket 客户端
 # ─────────────────────────────────────────────────────────────────────────
@@ -143,14 +172,13 @@ class AgentClient:
         self.config = config
         self.ws = None
         self.connected = False       # WebSocket 传输层是否连通
-        self.authenticated = False   # 应用层是否已认证/配对完成，可以正常工作
-        self.mac_address = get_mac_address()
+        self.authenticated = False   # 应用层是否已认证（收到过 pc_info）
         self.hostname = get_hostname()
         self.os = get_os_name()
         self.pc_name = None
+        self.operator_id = None      # 这把密钥归属的 operator（来自服务端 pc_info）
         self.callbacks = callbacks or {}
         self.reconnect_count = 0
-        self.max_reconnect = 5
         self._connecting = False  # 防止开关被连续点击时启动重复的连接线程
         self.last_server_seen = None  # 最近一次收到服务端任意消息的时间，心跳判活用
 
@@ -167,13 +195,42 @@ class AgentClient:
         port_part = "" if port == 443 else f":{port}"
         return f"wss://{self.config['server_host']}{port_part}/agent"
 
-    def connect(self):
-        """建立连接。零持久化下永远只是"连上、等待用户在 GUI 里走验证码流程"，
-        不会自动认证——连接成功只代表传输层通了，跟"已配对"是两回事。"""
-        if not self.config.get("enabled"):
-            log("Agent 已禁用，跳过连接")
-            return
+    def get_plain_key(self):
+        return decrypt_key(self.config.get("key_enc"))
 
+    def connect(self):
+        """后台线程入口：只要本地有已保存的密钥，就无限循环"连接 → 断开 → 退避
+        等待 → 再连"，直到用户手动禁用或密钥被清空——不需要任何人工步骤。
+        写成迭代循环而不是"on_close 里递归调用 connect()"，是特意避免的一个坑：
+        旧版（5 次重连上限）用递归也没事，反正最多 5 层；这版断线重连没有次数
+        上限，24/7 挂着跑，网络抖个几千次，递归会让 Python 调用栈无限往深
+        长（每次重连的栈帧永远不会退栈，因为下一次 connect() 是在上一次的
+        on_close 回调里直接调用的），迟早栈溢出。循环没有这个问题。"""
+        while True:
+            if not self.config.get("enabled"):
+                log("Agent 已禁用，停止连接循环")
+                self._connecting = False
+                return
+            key = self.get_plain_key()
+            if not key:
+                log("本地没有保存密钥，等待用户粘贴")
+                self._cb("on_status_change", "未配置密钥", False)
+                self._connecting = False
+                return
+
+            self._connect_once()
+
+            if not self.config.get("enabled") or not self.get_plain_key():
+                self._connecting = False
+                return
+            self.reconnect_count += 1
+            wait_time = min(2 ** min(self.reconnect_count, 5), 30)
+            log(f"将在 {wait_time} 秒后重连（第 {self.reconnect_count} 次，无限重试）...")
+            time.sleep(wait_time)
+
+    def _connect_once(self):
+        """建立一次连接，阻塞到这条连接断开为止（ws.run_forever 的语义）。
+        不在这里做任何重试决策——重试节奏统一由 connect() 的循环控制。"""
         try:
             server_url = self.get_server_url()
             log(f"正在连接到 {server_url}...")
@@ -191,53 +248,33 @@ class AgentClient:
             # ping_interval/ping_timeout 不能省：CloudFront 对空闲连接有默认 60 秒左右
             # 的超时，中间人（CloudFront/路由器/NAT）可能早就把连接悄悄断了，但本地
             # socket 在收到明确的 RST/FIN 之前会一直显示"已连接"——没有心跳包，客户端
-            # 可能永远发现不了连接已经死了（2026-09-08 实锤：GUI 显示已连接，服务端
-            # 数天没收到任何流量，`last_seen` 停在很早之前，判定离线）。25/10 秒留出
-            # 足够余量，一旦探测失败会触发 on_close，走已有的 reconnect() 重新连上。
+            # 可能永远发现不了连接已经死了。25/10 秒留出足够余量，一旦探测失败会触发
+            # on_close（run_forever 内部调用完 on_close 后自然返回，回到 connect() 的循环）。
             ws.run_forever(ping_interval=25, ping_timeout=10)
         except Exception as e:
             log(f"连接失败: {e}")
             self.connected = False
-            self._connecting = False
             self._cb("on_status_change", "连接失败", False)
-            self.reconnect()
 
     def on_open(self, ws):
         self.connected = True
         self._connecting = False
         self.reconnect_count = 0
         self.last_server_seen = time.time()
-        log("WebSocket 连接打开")
-        # 零持久化：没有任何"记住我"的凭证可以自动发送，永远等待用户在 GUI 里
-        # 获取验证码——这不是缺省分支，是唯一分支。
-        log("尚未配对，等待用户在 GUI 里获取验证码")
-        self._cb("on_status_change", "未配对", False)
-
-    def request_pairing_code(self):
-        """GUI 点击"获取验证码"时调用"""
-        if not self.ws or not self.connected:
-            return False
-        self.ws.send(json.dumps({
-            "type": "request_pairing_code",
-            "mac_address": self.mac_address,
+        log("WebSocket 连接打开，发送密钥认证")
+        key = self.get_plain_key()
+        if not key:
+            log("密钥丢失（解密失败），断开等待用户重新粘贴")
+            ws.close()
+            return
+        ws.send(json.dumps({
+            "type": "connect",
+            "key": key,
             "hostname": self.hostname,
             "os": self.os,
-        }))
-        log("已请求配对验证码")
-        return True
-
-    def submit_pairing_code(self, code):
-        """GUI 输入验证码点击"验证"时调用"""
-        if not self.ws or not self.connected:
-            return False
-        self.ws.send(json.dumps({
-            "type": "verify_pairing_code",
-            "mac_address": self.mac_address,
-            "code": code,
             "name": self.config.get("name") or self.hostname,
         }))
-        log("已提交验证码")
-        return True
+        self._cb("on_status_change", "正在认证…", False)
 
     def on_message(self, ws, message):
         # 收到服务端任意消息都算一次"确认还活着"——不止 pong，这样即使服务端
@@ -247,32 +284,30 @@ class AgentClient:
             data = json.loads(message)
             msg_type = data.get("type")
 
-            if msg_type == "pairing_code_sent":
-                log("验证码已发送到 Telegram")
-                self._cb("on_pairing_code_sent")
-
-            elif msg_type == "pairing_success":
-                # 零持久化：服务端不再颁发任何凭证，这里也没有什么要保存的——
-                # 连接本身就是这次认证的全部有效期，断开就得重新走一遍。
-                log("配对成功，本次连接已建立")
-                self._cb("on_pairing_success")
-
-            elif msg_type == "pairing_failed":
-                reason = data.get("reason", "error")
-                log(f"配对失败: {reason}")
-                self._cb("on_pairing_failed", reason)
-
-            elif msg_type == "pc_info":
+            if msg_type == "pc_info":
                 self.pc_name = data.get("name", "未命名")
+                self.operator_id = data.get("operatorId")
                 self.authenticated = True
-                self._cb("on_pc_info", self.pc_name)
+                self._cb("on_pc_info", self.pc_name, self.operator_id)
                 self._cb("on_status_change", "已连接", True)
-                log(f"PC 信息已更新: {self.pc_name}")
+                log(f"认证成功: {self.pc_name}（operator={self.operator_id}）")
 
             elif msg_type == "command":
                 cmd_id = data.get("id")
                 cmd = data.get("command")
-                log(f"执行命令: {cmd}")
+                executed_by = str(data.get("executedBy") or "")
+                is_owner_cmd = bool(data.get("isOwner"))
+                # 客户端自己核对一遍发起人身份——服务端路由时已经挡过一次，这里
+                # 是第二道硬卡：不是这把密钥的 operator 本人、也不是 owner，拒绝执行。
+                if not is_owner_cmd and self.operator_id and executed_by != str(self.operator_id):
+                    log(f"拒绝执行：发起人 {executed_by} 既不是本机 operator（{self.operator_id}）也不是 owner")
+                    ws.send(json.dumps({
+                        "type": "command_result", "id": cmd_id,
+                        "status": "failed", "output": "拒绝执行：发起人身份跟本机不匹配",
+                    }))
+                    return
+                self._cb("on_command_from", executed_by, is_owner_cmd)
+                log(f"执行命令（来自 {executed_by}）: {cmd}")
                 result = self.execute_command(cmd)
                 ws.send(json.dumps({
                     "type": "command_result",
@@ -331,12 +366,14 @@ class AgentClient:
         log(f"WebSocket 关闭: code={close_status_code} msg={close_msg}")
         self.connected = False
         self.authenticated = False
-        # 零持久化下没有"这次断开是不是意味着凭证失效"的区分——没有凭证可失效，
-        # 每次断开，不论原因（网络波动、服务端重启、被管理员断开、心跳超时…），
-        # 都是同一种状态：必须重新走一遍验证码流程。统一回到配对界面。
-        self._cb("on_status_change", "已断开，需重新配对", False)
-        self._cb("on_disconnected")
-        self.reconnect()
+        reason = "连接已断开，正在自动重连…"
+        if close_status_code == 4001:
+            reason = "密钥无效或已被管理员吊销，请联系管理员获取新密钥后点\"更换密钥\""
+        self._cb("on_status_change", reason, False)
+        self._cb("on_disconnected", close_status_code)
+        # 不在这里发起重连——run_forever() 到这里就要返回了，控制权交回
+        # connect() 的循环，由它统一决定要不要、等多久再重连，见 connect() 里
+        # 那段"为什么用循环不用递归"的注释。
 
     def execute_command(self, cmd):
         try:
@@ -347,22 +384,10 @@ class AgentClient:
         except Exception as e:
             return {"success": False, "output": str(e)}
 
-    def reconnect(self):
-        if not self.config.get("enabled"):
-            return
-        if self.reconnect_count < self.max_reconnect:
-            self.reconnect_count += 1
-            wait_time = min(2 ** self.reconnect_count, 60)
-            log(f"将在 {wait_time} 秒后重连（第 {self.reconnect_count} 次）...")
-            time.sleep(wait_time)
-            self.connect()
-        else:
-            log("重连失败次数过多，停止重试")
-
     def set_enabled(self, enabled):
         """开关立即生效：关闭时断开连接，开启时拉起新的连接线程。
-        不能只写配置——之前的实现只在点"保存设置"时更新 config，开关本身不触发
-        任何实际的连接/断开动作，用户勾掉复选框后连接依然挂着。"""
+        这是用户唯一的"手动离线"入口——不勾掉这个、不退出程序，客户端就会
+        一直自动重连，不会像旧版那样断一次就死等人工重新配对。"""
         self.config["enabled"] = enabled
         save_config(self.config)
         if enabled:
@@ -373,6 +398,17 @@ class AgentClient:
         else:
             if self.ws:
                 self.ws.close()
+
+    def set_key(self, plain_key):
+        """保存一把新密钥（加密落盘）并立即尝试连接——用于首次配置，或吊销后换新。"""
+        self.config["key_enc"] = encrypt_key(plain_key)
+        save_config(self.config)
+        if self.ws:
+            self.ws.close()
+        self.reconnect_count = 0
+        if self.config.get("enabled") and not self._connecting:
+            self._connecting = True
+            threading.Thread(target=self.connect, daemon=True).start()
 
     def stop(self):
         self.config["enabled"] = False
@@ -394,22 +430,16 @@ ACCENT = "#4FC3F7"
 def create_gui(config):
     sg.theme("DarkGrey13")
     sg.set_options(font=FONT_LABEL)
-    # 零持久化：没有"已配对"这个持久状态可以据此决定初始界面——每次启动都是
-    # 一条全新连接，永远从配对表单开始，连上并通过验证码后才会切到主界面。
+    has_key = bool(config.get("key_enc"))
 
-    pairing_layout = [
-        [sg.Text("需要配对才能连接", font=FONT_BOLD, pad=((0, 0), (0, 10)))],
-        [sg.Text("点击下方按钮获取验证码，管理员会在 Telegram 收到推送；\n每次断线后都需要重新走这个流程，不会自动重连",
+    key_layout = [
+        [sg.Text("粘贴管理员发给你的密钥", font=FONT_BOLD, pad=((0, 0), (0, 10)))],
+        [sg.Text("在 Telegram 里找 /pc_newkey 生成的那条消息（5 分钟后会自动撤回，\n请先复制），粘贴到下面，保存后自动连接，以后不用再输入",
                   font=FONT_SUB, text_color="grey", pad=((0, 0), (0, 12)))],
-        [sg.Button("获取验证码", key="-GET_CODE-", size=(14, 1))],
-        [sg.Text("验证码", font=FONT_SUB, text_color="grey", key="-PAIR_CODE_LABEL-",
-                  visible=False, pad=((0, 0), (14, 2)))],
-        [
-            sg.InputText("", key="-PAIR_CODE-", size=(16, 1), visible=False),
-            sg.Button("验证", key="-VERIFY_CODE-", size=(8, 1), visible=False),
-        ],
-        [sg.Text("", key="-PAIR_STATUS-", font=FONT_SUB, text_color=ACCENT,
-                  size=(45, 2), pad=((0, 0), (12, 0)))],
+        [sg.InputText("", key="-KEY_INPUT-", size=(48, 1))],
+        [sg.Button("保存并连接", key="-SAVE_KEY-", size=(14, 1))],
+        [sg.Text("", key="-KEY_STATUS-", font=FONT_SUB, text_color=ACCENT,
+                  size=(50, 2), pad=((0, 0), (12, 0)))],
     ]
 
     main_layout = [
@@ -421,8 +451,12 @@ def create_gui(config):
          sg.Text("", key="-STATUS-", font=FONT_LABEL)],
         [sg.Text("最后心跳", font=FONT_SUB, text_color="grey", size=(10, 1)),
          sg.Push(), sg.Text("", key="-LAST_BEAT-", font=FONT_LABEL)],
+        [sg.Text("最近命令来自", font=FONT_SUB, text_color="grey", size=(10, 1)),
+         sg.Push(), sg.Text("", key="-LAST_CMD_FROM-", font=FONT_LABEL)],
         [sg.HSeparator(pad=((0, 0), (14, 12)))],
-        [sg.Checkbox("启用远程访问", default=config.get("enabled", True), key="-ENABLED-", enable_events=True)],
+        [sg.Checkbox("启用远程连接（勾掉=手动离线，停止自动重连）",
+                      default=config.get("enabled", True), key="-ENABLED-", enable_events=True)],
+        [sg.Button("更换密钥", key="-CHANGE_KEY-", pad=((0, 0), (10, 0)))],
     ]
 
     layout = [
@@ -432,11 +466,9 @@ def create_gui(config):
         [sg.HSeparator(pad=((0, 0), (14, 14)))],
         [sg.Text("显示名称", font=FONT_SUB, text_color="grey", size=(10, 1)),
          sg.Push(), sg.InputText(config.get("name") or get_hostname(), key="-NAME-", size=(22, 1))],
-        [sg.Text("设备 ID", font=FONT_SUB, text_color="grey", size=(10, 1)),
-         sg.Push(), sg.Text(get_mac_address(), font=FONT_LABEL)],
         [sg.HSeparator(pad=((0, 0), (14, 14)))],
-        [sg.Column(pairing_layout, key="-PAIRING_COL-", visible=True)],
-        [sg.Column(main_layout, key="-MAIN_COL-", visible=False)],
+        [sg.Column(key_layout, key="-KEY_COL-", visible=not has_key)],
+        [sg.Column(main_layout, key="-MAIN_COL-", visible=has_key)],
         [sg.HSeparator(pad=((0, 0), (18, 14)))],
         [sg.Button("保存设置", key="-SAVE-"), sg.Button("打开日志"),
          sg.Push(), sg.Button("退出", button_color=("white", "#B00020"))],
@@ -456,14 +488,13 @@ def main():
     # 不能直接操作 GUI 控件（PySimpleGUI 不是线程安全的）。
     client = AgentClient(config, {
         "on_status_change": lambda status, connected: window.write_event_value("-EVT_STATUS-", (status, connected)),
-        "on_pc_info": lambda name: window.write_event_value("-EVT_PCINFO-", name),
-        "on_pairing_code_sent": lambda: window.write_event_value("-EVT_CODE_SENT-", None),
-        "on_pairing_success": lambda: window.write_event_value("-EVT_PAIR_SUCCESS-", None),
-        "on_pairing_failed": lambda reason: window.write_event_value("-EVT_PAIR_FAILED-", reason),
-        "on_disconnected": lambda: window.write_event_value("-EVT_DISCONNECTED-", None),
+        "on_pc_info": lambda name, operator_id: window.write_event_value("-EVT_PCINFO-", (name, operator_id)),
+        "on_disconnected": lambda code: window.write_event_value("-EVT_DISCONNECTED-", code),
+        "on_command_from": lambda who, is_owner: window.write_event_value("-EVT_CMD_FROM-", (who, is_owner)),
     })
 
-    threading.Thread(target=client.connect, daemon=True).start()
+    if client.get_plain_key():
+        threading.Thread(target=client.connect, daemon=True).start()
 
     last_beat = time.time()
 
@@ -473,45 +504,31 @@ def main():
         if event == sg.WINDOW_CLOSED or event == "退出":
             break
 
-        if event == "-GET_CODE-":
-            config["name"] = (values.get("-NAME-") or "").strip() or None
-            save_config(config)
-            if client.request_pairing_code():
-                window["-PAIR_STATUS-"].update("正在请求验证码…", text_color="orange")
+        if event == "-SAVE_KEY-":
+            key = (values.get("-KEY_INPUT-") or "").strip()
+            if not key:
+                window["-KEY_STATUS-"].update("请先粘贴密钥", text_color="red")
             else:
-                window["-PAIR_STATUS-"].update("尚未连接到服务器，请稍候重试", text_color="red")
+                config["name"] = (values.get("-NAME-") or "").strip() or None
+                client.set_key(key)
+                window["-KEY_COL-"].update(visible=False)
+                window["-MAIN_COL-"].update(visible=True)
+                window["-STATUS-"].update("正在连接…")
+                log("已保存新密钥，开始连接")
 
-        elif event == "-VERIFY_CODE-":
-            code = values["-PAIR_CODE-"].strip()
-            if code:
-                client.submit_pairing_code(code)
-                window["-PAIR_STATUS-"].update("正在验证…", text_color="orange")
-
-        elif event == "-EVT_CODE_SENT-":
-            window["-PAIR_CODE_LABEL-"].update(visible=True)
-            window["-PAIR_CODE-"].update(visible=True)
-            window["-VERIFY_CODE-"].update(visible=True)
-            window["-PAIR_STATUS-"].update("验证码已发送，请在 Telegram 查收（1 小时内有效）", text_color="light green")
-
-        elif event == "-EVT_PAIR_SUCCESS-":
-            window["-PAIRING_COL-"].update(visible=False)
-            window["-MAIN_COL-"].update(visible=True)
-            log("配对成功，切换到主界面")
-
-        elif event == "-EVT_PAIR_FAILED-":
-            reason = values[event]
-            window["-PAIR_STATUS-"].update(
-                "配对失败: " + PAIRING_FAIL_REASONS.get(reason, reason), text_color="red")
+        elif event == "-CHANGE_KEY-":
+            window["-MAIN_COL-"].update(visible=False)
+            window["-KEY_COL-"].update(visible=True)
+            window["-KEY_INPUT-"].update("")
+            window["-KEY_STATUS-"].update("")
 
         elif event == "-EVT_DISCONNECTED-":
-            # 零持久化：任何一次断开（网络波动、服务重启、被管理员断开、心跳
-            # 超时……不区分原因）都必须重新走验证码流程，统一切回配对表单。
-            window["-MAIN_COL-"].update(visible=False)
-            window["-PAIRING_COL-"].update(visible=True)
-            window["-PAIR_CODE_LABEL-"].update(visible=False)
-            window["-PAIR_CODE-"].update(visible=False, value="")
-            window["-VERIFY_CODE-"].update(visible=False)
-            window["-PAIR_STATUS-"].update("连接已断开，请重新获取验证码配对", text_color="orange")
+            # 密钥仍然有效的话，客户端在后台会自动无限重连，界面留在原地
+            # 就行，不用像旧版那样切回什么"配对表单"——除非密钥被吊销了
+            # （4001），那种情况下手动重连也没用，提示用户换密钥。
+            code = values[event]
+            if code == 4001:
+                window["-KEY_STATUS-"].update("密钥无效或已被吊销，请点\"更换密钥\"粘贴新的", text_color="red")
 
         elif event == "-EVT_STATUS-":
             status, connected = values[event]
@@ -519,14 +536,19 @@ def main():
             window["-STATUS_DOT-"].update(text_color="#43A047" if connected else "#E53935")
 
         elif event == "-EVT_PCINFO-":
-            window["-PC_NAME-"].update(values[event])
+            name, operator_id = values[event]
+            window["-PC_NAME-"].update(name + (f"（operator: {operator_id}）" if operator_id else ""))
+
+        elif event == "-EVT_CMD_FROM-":
+            who, is_owner = values[event]
+            window["-LAST_CMD_FROM-"].update(who + ("（owner）" if is_owner else "") + " · " + time.strftime("%H:%M:%S"))
 
         elif event == "-ENABLED-":
             enabled = values["-ENABLED-"]
             client.set_enabled(enabled)
-            window["-STATUS-"].update("已禁用" if not enabled else "正在连接…")
+            window["-STATUS-"].update("已手动离线" if not enabled else "正在连接…")
             window["-STATUS_DOT-"].update(text_color="#E53935")
-            log(f"远程访问开关: enabled={enabled}")
+            log(f"远程连接开关: enabled={enabled}")
 
         elif event == "-SAVE-":
             config["name"] = (values.get("-NAME-") or "").strip() or None
@@ -551,7 +573,7 @@ def main():
 
         # 心跳判活兜底：已认证但太久没收到服务端任何消息，说明连接已经死了
         # （TCP 半开、中间设备悄悄断了但本地 socket 没收到 FIN/RST），不能让
-        # GUI 一直显示"已连接"。主动断开，交给 on_close 走统一的重连/回配对表单流程。
+        # GUI 一直显示"已连接"。主动断开，交给 on_close 走统一的自动重连流程。
         if client.authenticated and client.last_server_seen is not None \
                 and time.time() - client.last_server_seen > HEARTBEAT_STALE_SECS:
             log(f"心跳超时（{HEARTBEAT_STALE_SECS}秒未收到服务端消息），判定连接已死")

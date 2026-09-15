@@ -32,10 +32,17 @@ bot 服务端代码，改了必须重启 bot 才生效，混在一起会让"这�
 ## 架构
 
 单文件 `agent.py`：`websocket-client` 连到 `wss://claudbotjs.doez.ai/agent`
-（跟 claude-code-AI 的 Mini App 共用同一个 CloudFront 分发/端口）。2026-09-14 起
-认证零持久化：每次连接（首次或任意一次重连）都要重新走一遍验证码流程，不保存
-任何 token，断线没有"记住我"。校验通过后收到 `command` 消息就用 `subprocess.run`
-本地执行并回传结果。另外内置一套"灯光库"能力，供现场灯光控制使用：
+（跟 claude-code-AI 的 Mini App 共用同一个 CloudFront 分发/端口）。2026-09-16 起
+认证换成服务端签发的强密钥（不再是验证码）：管理员在 Telegram 用 `/pc_newkey`
+生成一把密钥推给某个 operator，粘贴进 GUI 后本地**加密**保存（`encrypt_key`/
+`decrypt_key`，本机专属的对称密钥另存一个文件，拷走 `config.json` 本身解不开），
+之后每次启动/断线都自动带着这把密钥重连，无限重试直到用户手动勾掉"启用远程
+连接"或退出——不再需要人工过一遍配对流程。密钥被管理员吊销后，服务端会在一轮
+心跳内主动断开，此后自动重连会持续被拒绝（收到 WS 关闭码 4001），需要联系管理员
+拿新密钥、在 GUI 里点"更换密钥"重新粘贴。收到 `command` 消息后先核对里面的
+`executedBy`/`isOwner`（是不是这把密钥的 operator 本人或 owner）——这是跟服务端
+路由校验并列的第二道硬卡，不只信任传输链路——通过才用 `subprocess.run` 本地
+执行并回传结果。另外内置一套"灯光库"能力，供现场灯光控制使用：
 
 - **USB 灯光控制**（`run_light_cli`/`send_midi_message`/`send_dmx_frame`）：
   `agent.exe light list|midi|dmx` 命令行子命令，通过 `python-rtmidi`/`pyserial`
@@ -65,8 +72,9 @@ pip install -r requirements.txt
 python agent.py
 ```
 
-`python-rtmidi`（C 扩展，PyInstaller 容易漏掉原生绑定）打包时需要
-`--collect-all rtmidi`，已经在 `build.yml` 里配好，改依赖时注意保留这个 flag。
+`python-rtmidi`/`cryptography`（都带 C 扩展，PyInstaller 容易漏掉原生绑定）
+打包时需要 `--collect-all rtmidi --collect-all cryptography`，已经在
+`build.yml` 里配好，改依赖时注意保留这两个 flag。
 
 ## 测试
 

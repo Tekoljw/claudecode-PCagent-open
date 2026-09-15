@@ -41,8 +41,10 @@ jobs:
       # 6.x 已知问题），onedir 没有这层中间的 bootloader，天然只有一个进程/窗口。
       # --collect-all rtmidi：python-rtmidi 是 C 扩展，PyInstaller 静态分析常漏掉
       # 其原生绑定，不显式收集打包出来的 exe 会在运行时报模块缺失。
+      # --collect-all cryptography：同样带 C 扩展（_cffi_backend），2026-09-16
+      # 加密存储密钥引入，防患于未然一并显式收集。
       - name: 打包（onedir）
-        run: pyinstaller --onedir --windowed --name agent --collect-all rtmidi --hidden-import=serial.tools.list_ports agent.py
+        run: pyinstaller --onedir --windowed --name agent --collect-all rtmidi --collect-all cryptography --hidden-import=serial.tools.list_ports agent.py
 
       - name: 压缩（Windows）
         if: runner.os == 'Windows'
